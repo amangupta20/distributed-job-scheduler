@@ -51,3 +51,8 @@ docs/benchmarks/.scratch/
 .idea/
 .vscode/
 *.swp
+
+# Agent workspace directories
+.codex/
+.agents/
+
