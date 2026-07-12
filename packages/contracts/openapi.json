@@ -772,6 +772,110 @@
         }
       }
     },
+    "/api/v1/workers/register": {
+      "post": {
+        "tags": [
+          "Workers"
+        ],
+        "summary": "Register Worker",
+        "operationId": "register_worker_api_v1_workers_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerRegister"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workers/{worker_id}/heartbeat": {
+      "post": {
+        "tags": [
+          "Workers"
+        ],
+        "summary": "Worker Heartbeat",
+        "operationId": "worker_heartbeat_api_v1_workers__worker_id__heartbeat_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "worker_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Worker Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerHeartbeat"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeartbeatResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health/live": {
       "get": {
         "summary": "Live",
@@ -831,6 +935,25 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "HeartbeatResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "default": "ok"
+          },
+          "cancelled_job_ids": {
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": "array",
+            "title": "Cancelled Job Ids"
+          }
+        },
+        "type": "object",
+        "title": "HeartbeatResponse"
       },
       "JobCreate": {
         "properties": {
@@ -1496,6 +1619,100 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "WorkerHeartbeat": {
+        "properties": {
+          "running_job_ids": {
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": "array",
+            "title": "Running Job Ids"
+          }
+        },
+        "type": "object",
+        "title": "WorkerHeartbeat"
+      },
+      "WorkerRegister": {
+        "properties": {
+          "worker_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Worker Id"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "version": {
+            "type": "string",
+            "maxLength": 100,
+            "title": "Version",
+            "default": "1.0.0"
+          },
+          "concurrency_limit": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Concurrency Limit"
+          }
+        },
+        "type": "object",
+        "required": [
+          "worker_id",
+          "name",
+          "concurrency_limit"
+        ],
+        "title": "WorkerRegister"
+      },
+      "WorkerResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "concurrency_limit": {
+            "type": "integer",
+            "title": "Concurrency Limit"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "version",
+          "status",
+          "concurrency_limit",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "WorkerResponse"
       }
     },
     "securitySchemes": {
