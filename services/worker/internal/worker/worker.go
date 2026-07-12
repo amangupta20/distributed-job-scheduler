@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -178,8 +177,11 @@ func (w *Worker) executeJob(ctx context.Context, j claim.Job) {
 	log := w.log.With("job_id", j.ID, "type", j.Type, "attempt", j.AttemptCount+1)
 	log.Info("executing job")
 
-	if err := claim.MarkRunning(ctx, w.pool, j.ID, w.id, j.LeaseToken); err != nil {
-		log.Warn("mark running failed (stale lease?)", "err", err)
+	if ok, err := claim.MarkRunningFenced(ctx, w.pool, j); err != nil {
+		log.Warn("mark running failed", "err", err)
+		return
+	} else if !ok {
+		log.Warn("mark running rejected stale or expired lease")
 		return
 	}
 
@@ -196,46 +198,47 @@ func (w *Worker) executeJob(ctx context.Context, j claim.Job) {
 	go w.extendLeaseLoop(ctx, j, stopExtend)
 	defer close(stopExtend)
 
-	// Record execution attempt
-	executionID := uuid.New()
 	startTime := time.Now()
-	w.recordExecution(ctx, executionID, j.ID, j.AttemptCount+1, startTime)
 
 	// Look up and run handler
 	h := w.handlers.Get(j.Type)
+	var result handler.Result
 	if h == nil {
-		log.Error("unknown job type", "type", j.Type)
-		if err := claim.FailJob(ctx, w.pool, j.ID, w.id, j.LeaseToken, fmt.Sprintf("unknown job type: %s", j.Type)); err != nil {
-			log.Error("fail job", "err", err)
+		result = handler.Result{
+			Success: false, Retryable: false,
+			Error: fmt.Sprintf("unknown job type: %s", j.Type),
 		}
-		return
+	} else {
+		result = h.Execute(jobCtx, j.Payload)
 	}
-
-	result := h.Execute(jobCtx, j.Payload)
 	elapsed := time.Since(startTime)
-
-	// Write logs
-	for _, entry := range result.Logs {
-		w.writeLog(ctx, executionID, j.ID, entry)
-	}
+	persisted := persistenceResult(result)
 
 	// Finalize
 	if result.Success {
 		log.Info("job completed", "elapsed_ms", elapsed.Milliseconds())
-		if err := claim.Complete(ctx, w.pool, j.ID, w.id, j.LeaseToken); err != nil {
+		if ok, err := claim.CompleteResult(ctx, w.pool, j, persisted); err != nil {
 			log.Error("complete job", "err", err)
+		} else if !ok {
+			log.Warn("complete job rejected stale or expired lease")
 		}
-		w.finalizeExecution(ctx, executionID, true, result.Output, "")
 	} else {
 		log.Warn("job failed", "elapsed_ms", elapsed.Milliseconds(), "error", result.Error, "retryable", result.Retryable)
-		failReason := result.Error
-		if !result.Retryable {
-			failReason = "[permanent] " + failReason
-		}
-		if err := claim.FailJob(ctx, w.pool, j.ID, w.id, j.LeaseToken, failReason); err != nil {
+		if ok, err := claim.FailResult(ctx, w.pool, j, persisted); err != nil {
 			log.Error("fail job", "err", err)
+		} else if !ok {
+			log.Warn("fail job rejected stale or expired lease")
 		}
-		w.finalizeExecution(ctx, executionID, false, result.Output, result.Error)
+	}
+}
+
+func persistenceResult(result handler.Result) claim.ExecutionResult {
+	logs := make([]claim.LogEntry, len(result.Logs))
+	for i, entry := range result.Logs {
+		logs[i] = claim.LogEntry{Level: entry.Level, Message: entry.Message, Fields: entry.Fields}
+	}
+	return claim.ExecutionResult{
+		Output: result.Output, Logs: logs, Retryable: result.Retryable, Error: result.Error,
 	}
 }
 
@@ -254,8 +257,11 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, j claim.Job, stop <-chan s
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := claim.ExtendLease(ctx, w.pool, j.ID, w.id, j.LeaseToken, w.cfg.LeaseDuration()); err != nil {
+			if ok, err := claim.ExtendLeaseFenced(ctx, w.pool, j, w.cfg.LeaseDuration()); err != nil {
 				w.log.Warn("extend lease", "job_id", j.ID, "err", err)
+			} else if !ok {
+				w.log.Warn("extend lease rejected stale or expired lease", "job_id", j.ID)
+				return
 			}
 		}
 	}
@@ -271,44 +277,6 @@ func (w *Worker) sendHeartbeat(ctx context.Context) {
 		if ctx.Err() == nil {
 			w.log.Warn("heartbeat write failed", "err", err)
 		}
-	}
-}
-
-// recordExecution inserts a job_executions row for the current attempt.
-func (w *Worker) recordExecution(ctx context.Context, execID, jobID uuid.UUID, attempt int, startedAt time.Time) {
-	if _, err := w.pool.Exec(ctx, `
-		INSERT INTO job_executions (id, job_id, worker_id, attempt_number, status, started_at)
-		VALUES ($1, $2, $3, $4, 'running', $5)
-		ON CONFLICT DO NOTHING
-	`, execID, jobID, w.id, attempt, startedAt); err != nil {
-		w.log.Warn("record execution", "err", err)
-	}
-}
-
-// finalizeExecution updates the job_executions row with the outcome.
-func (w *Worker) finalizeExecution(ctx context.Context, execID uuid.UUID, success bool, output map[string]any, errMsg string) {
-	status := "completed"
-	if !success {
-		status = "failed"
-	}
-	logsJSON, _ := json.Marshal(output)
-	if _, err := w.pool.Exec(ctx, `
-		UPDATE job_executions
-		SET status = $1, finished_at = now(), logs = $2, error_message = $3
-		WHERE id = $4
-	`, status, logsJSON, errMsg, execID); err != nil {
-		w.log.Warn("finalize execution", "err", err)
-	}
-}
-
-// writeLog inserts a structured job_logs row.
-func (w *Worker) writeLog(ctx context.Context, execID, jobID uuid.UUID, entry handler.LogEntry) {
-	payloadJSON, _ := json.Marshal(entry.Fields)
-	if _, err := w.pool.Exec(ctx, `
-		INSERT INTO job_logs (execution_id, job_id, level, message, payload)
-		VALUES ($1, $2, $3, $4, $5)
-	`, execID, jobID, entry.Level, entry.Message, payloadJSON); err != nil {
-		w.log.Warn("write log", "err", err)
 	}
 }
 

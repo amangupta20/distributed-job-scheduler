@@ -9,7 +9,7 @@
 
 ## Why this stands out
 
-PulseQueue is being built to demonstrate the hard parts of distributed job execution rather than hide them: atomic claims, renewable leases, fencing, bounded concurrency, graceful drain, and recovery after worker loss. These are design goals. Service implementation and executable evidence are still in progress.
+PulseQueue is being built to demonstrate the hard parts of distributed job execution rather than hide them: atomic claims, renewable leases, fencing, bounded concurrency, graceful drain, and recovery after worker loss. The Go worker now has database-backed evidence for exclusive claims, strict per-queue concurrency, shared rate-token budgets, lease fencing, policy-driven retries, and atomic dead-letter transitions. Graceful-drain and worker-loss recovery evidence remain in progress.
 
 ## Quick start
 
@@ -34,7 +34,7 @@ PostgreSQL is intended to be the single durable queue and source of truth. FastA
 
 ## Reliability model
 
-The target delivery model is at-least-once execution. The design calls for atomic `SKIP LOCKED` claims, renewable leases, per-claim fencing tokens, retry scheduling, dead-letter handling, and graceful worker drain. Exactly-once external side effects are explicitly not a project claim. These mechanisms remain unverified until their tests and implementation are committed.
+The delivery model is at-least-once execution. Worker claims use PostgreSQL `SKIP LOCKED`, database-clock schedule eligibility and leases, unique fencing tokens, strict queue concurrency limits, and transactionally shared rate tokens. Claiming also creates the execution attempt and state event in the same transaction. Completion and failure reject expired or stale leases; each terminal transaction persists the job state, execution outcome, structured logs, and state event together. Retryable failures use fixed, linear, or capped exponential policy delays, while permanent and exhausted failures enter the DLQ atomically. Exactly-once external side effects are explicitly not a project claim. Graceful worker drain and scheduler-driven recovery still require end-to-end evidence.
 
 ## Visual feature tour
 
@@ -65,6 +65,14 @@ make logs
 make observability
 ```
 
+The worker persistence integration suite requires a migrated PostgreSQL database and is run directly with:
+
+```bash
+cd services/worker
+WORKER_DATABASE_URL=postgresql://scheduler:scheduler@127.0.0.1:5432/scheduler \
+  go test -race ./internal/claim -v
+```
+
 These commands are stable workflow contracts. Their referenced services, tests, and scripts will be added in later milestones; this scaffold does not claim that application tests can run yet.
 
 ## Claim-to-evidence table
@@ -74,7 +82,9 @@ These commands are stable workflow contracts. Their referenced services, tests, 
 | Project-local agent concurrency is bounded to four threads with no recursive fan-out. | Configured | [Agent configuration](.codex/config.toml) |
 | Implementation roles have exclusive path ownership and a read-only reviewer role exists. | Configured | [Agent definitions](.codex/agents/) |
 | Environment names and canonical workflow commands are established. | Configured | [.env.example](.env.example) and [Makefile](Makefile) |
-| Atomic claiming, lease recovery, container health, UI behavior, and performance meet their design goals. | Not yet evidenced | Evidence will be added as the corresponding implementation milestones pass. |
+| Go workers claim exclusively while enforcing shared queue concurrency and rate budgets. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) |
+| Lease-fenced completion, policy retries, permanent failure, and exhausted-attempt DLQ transitions are atomic. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) and [`retry_test.go`](services/worker/internal/claim/retry_test.go) |
+| Scheduler lease recovery, graceful drain, container health, UI behavior, and performance meet their design goals. | Not yet evidenced | Evidence will be added as the corresponding implementation milestones pass. |
 
 ## Trade-offs and limitations
 
