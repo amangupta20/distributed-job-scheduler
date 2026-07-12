@@ -46,8 +46,11 @@ func main() {
 	}
 	log.Info("worker registered", "id", w.ID())
 
-	// Run the worker loop in background
+	// Run the worker loop in background. The completion channel ensures shutdown
+	// does not begin draining until claim admission has stopped.
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		w.Run(ctx)
 	}()
 
@@ -56,6 +59,7 @@ func main() {
 	<-ctx.Done()
 	log.Info("received shutdown signal, draining...")
 	w.BeginDrain()
+	<-runDone
 
 	// Mark worker as draining
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)

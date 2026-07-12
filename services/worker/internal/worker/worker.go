@@ -28,14 +28,24 @@ type Worker struct {
 	activeJobs sync.WaitGroup
 	sem        chan struct{} // bounded goroutine pool
 
-	draining atomic.Bool
-	jobsMu   sync.Mutex
-	cancels  map[uuid.UUID]context.CancelFunc
+	// admissionMu makes the transition to draining atomic with respect to a
+	// claim-and-dispatch cycle. A drain cannot start after a job is claimed but
+	// before it is counted as active.
+	admissionMu sync.Mutex
+	draining    atomic.Bool
+	jobsMu      sync.Mutex
+	cancels     map[uuid.UUID]context.CancelFunc
+
+	claimBatch     func(context.Context, *pgxpool.Pool, uuid.UUID, int, time.Duration) ([]claim.Job, error)
+	runExecution   func(context.Context, claim.Job)
+	extendLease    func(context.Context, *pgxpool.Pool, claim.Job, time.Duration) (bool, error)
+	leaseInterval  func() time.Duration
+	beforeDispatch func()
 }
 
 // New creates a new Worker.
 func New(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger) *Worker {
-	return &Worker{
+	w := &Worker{
 		id:       uuid.New(),
 		cfg:      cfg,
 		pool:     pool,
@@ -44,6 +54,17 @@ func New(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger) *Worker {
 		sem:      make(chan struct{}, cfg.Concurrency),
 		cancels:  make(map[uuid.UUID]context.CancelFunc),
 	}
+	w.claimBatch = claim.ClaimBatch
+	w.runExecution = w.executeJob
+	w.extendLease = claim.ExtendLeaseFenced
+	w.leaseInterval = func() time.Duration {
+		interval := w.cfg.LeaseDuration() / 2
+		if interval < time.Second {
+			return time.Second
+		}
+		return interval
+	}
+	return w
 }
 
 // ID returns the worker's UUID.
@@ -51,6 +72,8 @@ func (w *Worker) ID() uuid.UUID { return w.id }
 
 // BeginDrain prevents new claims while allowing in-flight executions to finish.
 func (w *Worker) BeginDrain() {
+	w.admissionMu.Lock()
+	defer w.admissionMu.Unlock()
 	w.draining.Store(true)
 }
 
@@ -127,6 +150,12 @@ func (w *Worker) Drain(timeout time.Duration) {
 	case <-time.After(timeout):
 		w.log.Warn("drain timeout exceeded, some jobs may not have completed")
 		w.cancelAllExecutions()
+		select {
+		case <-done:
+			w.log.Info("cancelled executions unwound before shutdown")
+		case <-time.After(time.Second):
+			w.log.Warn("cancelled executions did not unwind before shutdown grace period")
+		}
 	}
 }
 
@@ -163,7 +192,12 @@ func (w *Worker) listenNotify(ctx context.Context, notifyCh chan<- struct{}) {
 
 // claimAndDispatch claims a batch of jobs and dispatches each to the goroutine pool.
 func (w *Worker) claimAndDispatch(ctx context.Context) {
+	w.admissionMu.Lock()
+	defer w.admissionMu.Unlock()
 	if !w.AcceptingClaims() {
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	// Only claim up to available goroutine slots
@@ -176,7 +210,7 @@ func (w *Worker) claimAndDispatch(ctx context.Context) {
 		batchSize = w.cfg.BatchSize
 	}
 
-	jobs, err := claim.ClaimBatch(ctx, w.pool, w.id, batchSize, w.cfg.LeaseDuration())
+	jobs, err := w.claimBatch(ctx, w.pool, w.id, batchSize, w.cfg.LeaseDuration())
 	if err != nil {
 		if ctx.Err() == nil {
 			w.log.Error("claim batch", "err", err)
@@ -186,33 +220,47 @@ func (w *Worker) claimAndDispatch(ctx context.Context) {
 	if len(jobs) == 0 {
 		return
 	}
+	if ctx.Err() != nil || !w.AcceptingClaims() {
+		return
+	}
 	w.log.Info("claimed jobs", "count", len(jobs))
 
 	for _, j := range jobs {
-		w.sem <- struct{}{} // acquire slot
-		w.activeJobs.Add(1)
-		go func(j claim.Job) {
-			defer func() {
-				<-w.sem // release slot
-				w.activeJobs.Done()
-			}()
-			w.executeJob(j)
-		}(j)
+		if w.beforeDispatch != nil {
+			w.beforeDispatch()
+		}
+		w.dispatch(j)
 	}
 }
 
-// executeJob runs a single job to completion, handling lease extension and result reporting.
-func (w *Worker) executeJob(j claim.Job) {
-	log := w.log.With("job_id", j.ID, "type", j.Type, "attempt", j.AttemptCount+1)
-	log.Info("executing job")
+// dispatch admits a job under admissionMu, then gives it a context that is
+// independent from the claim loop's shutdown context.
+func (w *Worker) dispatch(j claim.Job) {
+	w.sem <- struct{}{} // acquire slot
+	jobCtx, release := w.newExecutionContext(j.ID, timeoutForJob(j))
+	w.activeJobs.Add(1)
+	go func() {
+		defer func() {
+			release()
+			<-w.sem // release slot
+			w.activeJobs.Done()
+		}()
+		w.runExecution(jobCtx, j)
+	}()
+}
 
-	// Build job execution context with timeout
+func timeoutForJob(j claim.Job) time.Duration {
 	timeout := time.Duration(j.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
-		timeout = 5 * time.Minute
+		return 5 * time.Minute
 	}
-	jobCtx, release := w.newExecutionContext(j.ID, timeout)
-	defer release()
+	return timeout
+}
+
+// executeJob runs a single job to completion, handling lease extension and result reporting.
+func (w *Worker) executeJob(jobCtx context.Context, j claim.Job) {
+	log := w.log.With("job_id", j.ID, "type", j.Type, "attempt", j.AttemptCount+1)
+	log.Info("executing job")
 
 	if ok, err := claim.MarkRunningFenced(jobCtx, w.pool, j); err != nil {
 		log.Warn("mark running failed", "err", err)
@@ -224,7 +272,7 @@ func (w *Worker) executeJob(j claim.Job) {
 
 	// Start lease extension in background
 	stopExtend := make(chan struct{})
-	go w.extendLeaseLoop(jobCtx, j, stopExtend, func() { w.cancelExecution(j.ID) })
+	go w.extendLeaseLoop(jobCtx, j, stopExtend)
 	defer close(stopExtend)
 
 	startTime := time.Now()
@@ -242,18 +290,20 @@ func (w *Worker) executeJob(j claim.Job) {
 	}
 	elapsed := time.Since(startTime)
 	persisted := persistenceResult(result)
+	finalizeCtx, releaseFinalize := w.finalizationContext()
+	defer releaseFinalize()
 
 	// Finalize
 	if result.Success {
 		log.Info("job completed", "elapsed_ms", elapsed.Milliseconds())
-		if ok, err := claim.CompleteResult(jobCtx, w.pool, j, persisted); err != nil {
+		if ok, err := claim.CompleteResult(finalizeCtx, w.pool, j, persisted); err != nil {
 			log.Error("complete job", "err", err)
 		} else if !ok {
 			log.Warn("complete job rejected stale or expired lease")
 		}
 	} else {
 		log.Warn("job failed", "elapsed_ms", elapsed.Milliseconds(), "error", result.Error, "retryable", result.Retryable)
-		if ok, err := claim.FailResult(jobCtx, w.pool, j, persisted); err != nil {
+		if ok, err := claim.FailResult(finalizeCtx, w.pool, j, persisted); err != nil {
 			log.Error("fail job", "err", err)
 		} else if !ok {
 			log.Warn("fail job rejected stale or expired lease")
@@ -272,12 +322,8 @@ func persistenceResult(result handler.Result) claim.ExecutionResult {
 }
 
 // extendLeaseLoop periodically extends the job's lease until stopped.
-func (w *Worker) extendLeaseLoop(ctx context.Context, j claim.Job, stop <-chan struct{}, cancelExecution func()) {
-	interval := w.cfg.LeaseDuration() / 2
-	if interval < time.Second {
-		interval = time.Second
-	}
-	ticker := time.NewTicker(interval)
+func (w *Worker) extendLeaseLoop(ctx context.Context, j claim.Job, stop <-chan struct{}) {
+	ticker := time.NewTicker(w.leaseInterval())
 	defer ticker.Stop()
 	for {
 		select {
@@ -286,15 +332,19 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, j claim.Job, stop <-chan s
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if ok, err := claim.ExtendLeaseFenced(ctx, w.pool, j, w.cfg.LeaseDuration()); err != nil {
+			if ok, err := w.extendLease(ctx, w.pool, j, w.cfg.LeaseDuration()); err != nil {
 				w.log.Warn("extend lease", "job_id", j.ID, "err", err)
 			} else if !ok {
 				w.log.Warn("extend lease rejected stale or expired lease", "job_id", j.ID)
-				cancelExecution()
+				w.cancelExecution(j.ID)
 				return
 			}
 		}
 	}
+}
+
+func (w *Worker) finalizationContext() (context.Context, func()) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
 }
 
 // newExecutionContext deliberately detaches handler lifetime from the claim-loop
