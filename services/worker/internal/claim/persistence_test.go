@@ -3,6 +3,7 @@ package claim_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -96,6 +97,116 @@ func TestConcurrentClaimsRespectQueueConcurrency(t *testing.T) {
 	}
 	if total != 3 {
 		t.Fatalf("concurrent workers claimed %d jobs, want exactly 3", total)
+	}
+}
+
+func TestConcurrentClaimsReturnEachOf100JobsExactlyOnce(t *testing.T) {
+	pool := testPool(t)
+	projectID, queueID := seedEnv(t, pool)
+	if _, err := pool.Exec(context.Background(), `UPDATE queues SET concurrency_limit = 100 WHERE id = $1`, queueID); err != nil {
+		t.Fatal(err)
+	}
+	seeded := make(map[uuid.UUID]bool, 100)
+	for range 100 {
+		seeded[seedJob(t, pool, projectID, queueID, "noop")] = true
+	}
+
+	var wg sync.WaitGroup
+	claimed := make(chan uuid.UUID, 200)
+	errs := make(chan error, 10)
+	for range 10 {
+		workerID := registerWorker(t, pool)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			jobs, err := claim.ClaimBatch(context.Background(), pool, workerID, 20, 30*time.Second)
+			if err != nil {
+				errs <- err
+				return
+			}
+			for _, job := range jobs {
+				claimed <- job.ID
+			}
+		}()
+	}
+	wg.Wait()
+	close(claimed)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent claim: %v", err)
+	}
+
+	seen := make(map[uuid.UUID]bool, 100)
+	for id := range claimed {
+		if seen[id] {
+			t.Fatalf("job returned twice: %s", id)
+		}
+		if !seeded[id] {
+			t.Fatalf("unexpected job returned: %s", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != len(seeded) {
+		t.Fatalf("claimed %d unique jobs, want %d", len(seen), len(seeded))
+	}
+}
+
+func TestClaimDoesNotLockUnrelatedEligibleQueue(t *testing.T) {
+	pool := testPool(t)
+	projectID, firstQueueID := seedEnv(t, pool)
+	secondQueueID := uuid.New()
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE queues SET priority = 100, concurrency_limit = 1 WHERE id = $1;
+		INSERT INTO queues
+		    (id, project_id, name, priority, concurrency_limit, pause_state, created_at, updated_at)
+		VALUES ($2, $3, 'independent', 0, 1, false, now(), now())
+	`, firstQueueID, secondQueueID, projectID); err != nil {
+		t.Fatal(err)
+	}
+	seedJob(t, pool, projectID, firstQueueID, "noop")
+	secondJobID := seedJob(t, pool, projectID, secondQueueID, "noop")
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM queues WHERE id = $1`, secondQueueID) })
+
+	firstWorker := registerWorker(t, pool)
+	secondWorker := registerWorker(t, pool)
+	functionName := "test_pause_claim_" + strings.ReplaceAll(firstWorker.String(), "-", "")
+	triggerName := functionName + "_trigger"
+	if _, err := pool.Exec(context.Background(), fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $fn$
+		BEGIN
+			IF NEW.worker_id = '%s'::uuid THEN PERFORM pg_sleep(1); END IF;
+			RETURN NEW;
+		END
+		$fn$;
+		CREATE TRIGGER %s BEFORE INSERT ON job_executions
+		FOR EACH ROW EXECUTE FUNCTION %s()
+	`, functionName, firstWorker, triggerName, functionName)); err != nil {
+		t.Fatalf("install claim pause trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON job_executions`, triggerName))
+		_, _ = pool.Exec(context.Background(), fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, functionName))
+	})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		jobs, err := claim.ClaimBatch(context.Background(), pool, firstWorker, 1, 30*time.Second)
+		if err == nil && (len(jobs) != 1 || jobs[0].QueueID != firstQueueID) {
+			err = fmt.Errorf("first worker claimed %+v, want one job from first queue", jobs)
+		}
+		firstDone <- err
+	}()
+	time.Sleep(250 * time.Millisecond)
+
+	jobs, err := claim.ClaimBatch(context.Background(), pool, secondWorker, 1, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != secondJobID {
+		t.Fatalf("second worker claimed %+v, want job %s from independent queue", jobs, secondJobID)
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

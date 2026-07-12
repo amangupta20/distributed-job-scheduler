@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,44 +57,26 @@ func ClaimBatch(ctx context.Context, pool *pgxpool.Pool, workerID uuid.UUID, bat
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	queueRows, err := tx.Query(ctx, `
-		SELECT q.id
-		FROM queues q
-		WHERE q.pause_state = false
-		  AND EXISTS (
-			SELECT 1 FROM jobs j
-			WHERE j.queue_id = q.id
-			  AND j.status IN ('queued', 'retry_scheduled')
-			  AND j.scheduled_at <= now()
-			  AND j.lease_expires_at IS NULL
-		  )
-		ORDER BY q.id
-		FOR UPDATE SKIP LOCKED
-	`)
+	queueID, found, err := lockNextQueue(ctx, tx, true)
 	if err != nil {
-		return nil, fmt.Errorf("lock eligible queues: %w", err)
+		return nil, err
 	}
-	var queueIDs []uuid.UUID
-	for queueRows.Next() {
-		var id uuid.UUID
-		if err := queueRows.Scan(&id); err != nil {
-			queueRows.Close()
-			return nil, fmt.Errorf("scan eligible queue: %w", err)
+	if !found {
+		// If every eligible queue is currently locked, wait for the highest-ranked
+		// one. This lets concurrent workers share a busy queue over successive
+		// transactions instead of returning empty batches indefinitely.
+		queueID, found, err = lockNextQueue(ctx, tx, false)
+		if err != nil {
+			return nil, err
 		}
-		queueIDs = append(queueIDs, id)
 	}
-	if err := queueRows.Err(); err != nil {
-		queueRows.Close()
-		return nil, fmt.Errorf("iterate eligible queues: %w", err)
-	}
-	queueRows.Close()
-	if len(queueIDs) == 0 {
+	if !found {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("commit empty claim: %w", err)
 		}
 		return nil, nil
 	}
-	queueIDArray := uuidArrayLiteral(queueIDs)
+	queueIDArray := "{" + queueID.String() + "}"
 
 	// Refill whole tokens using the database clock. Fractional elapsed time is
 	// retained by advancing rate_refilled_at only by the time actually consumed.
@@ -206,7 +187,6 @@ func ClaimBatch(ctx context.Context, pool *pgxpool.Pool, workerID uuid.UUID, bat
 	}
 	rows.Close()
 
-	claimedPerQueue := make(map[uuid.UUID]int)
 	for _, job := range jobs {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO job_executions
@@ -221,16 +201,13 @@ func ClaimBatch(ctx context.Context, pool *pgxpool.Pool, workerID uuid.UUID, bat
 		`, uuid.New(), job.ID, job.PreviousStatus, workerID); err != nil {
 			return nil, fmt.Errorf("insert claimed event: %w", err)
 		}
-		claimedPerQueue[job.QueueID]++
 	}
-	for queueID, count := range claimedPerQueue {
-		if _, err := tx.Exec(ctx, `
-			UPDATE queues
-			SET rate_tokens = rate_tokens - $1, updated_at = now()
-			WHERE id = $2 AND rate_limit_per_minute IS NOT NULL
-		`, count, queueID); err != nil {
-			return nil, fmt.Errorf("consume queue rate tokens: %w", err)
-		}
+	if _, err := tx.Exec(ctx, `
+		UPDATE queues
+		SET rate_tokens = rate_tokens - $1, updated_at = now()
+		WHERE id = $2 AND rate_limit_per_minute IS NOT NULL
+	`, len(jobs), queueID); err != nil {
+		return nil, fmt.Errorf("consume queue rate tokens: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit claim: %w", err)
@@ -238,12 +215,61 @@ func ClaimBatch(ctx context.Context, pool *pgxpool.Pool, workerID uuid.UUID, bat
 	return jobs, nil
 }
 
-func uuidArrayLiteral(ids []uuid.UUID) string {
-	values := make([]string, len(ids))
-	for i, id := range ids {
-		values[i] = id.String()
+func lockNextQueue(ctx context.Context, tx pgx.Tx, skipLocked bool) (uuid.UUID, bool, error) {
+	lockingClause := "FOR UPDATE OF q"
+	if skipLocked {
+		lockingClause += " SKIP LOCKED"
 	}
-	return "{" + strings.Join(values, ",") + "}"
+	query := `
+		WITH queue_usage AS (
+			SELECT q.id,
+			       count(jr.id) FILTER (WHERE jr.status IN ('claimed', 'running'))::integer AS active
+			FROM queues q
+			LEFT JOIN jobs jr ON jr.queue_id = q.id
+			GROUP BY q.id
+		), queue_heads AS (
+			SELECT q.id, head.score, head.scheduled_at, head.job_id
+			FROM queues q
+			JOIN queue_usage u ON u.id = q.id AND u.active < q.concurrency_limit
+			CROSS JOIN LATERAL (
+				SELECT j.id AS job_id,
+				       q.priority + j.priority + LEAST(100,
+				           floor(extract(epoch FROM (now() - j.scheduled_at)) / 60.0)::integer) AS score,
+				       j.scheduled_at
+				FROM jobs j
+				WHERE j.queue_id = q.id
+				  AND j.status IN ('queued', 'retry_scheduled')
+				  AND j.scheduled_at <= now()
+				  AND j.lease_expires_at IS NULL
+				ORDER BY score DESC, j.scheduled_at, j.id
+				LIMIT 1
+			) head
+			WHERE q.pause_state = false
+			  AND (
+				q.rate_limit_per_minute IS NULL OR
+				LEAST(q.rate_limit_per_minute,
+				      COALESCE(q.rate_tokens, q.rate_limit_per_minute) +
+				      GREATEST(0, floor(extract(epoch FROM
+				          (now() - COALESCE(q.rate_refilled_at, now()))) *
+				          q.rate_limit_per_minute / 60.0)::integer)) > 0
+			  )
+		)
+		SELECT q.id
+		FROM queues q
+		JOIN queue_heads h ON h.id = q.id
+		ORDER BY h.score DESC, h.scheduled_at, h.job_id, q.id
+		LIMIT 1
+		` + lockingClause
+
+	var queueID uuid.UUID
+	err := tx.QueryRow(ctx, query).Scan(&queueID)
+	if err == pgx.ErrNoRows {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, fmt.Errorf("lock next eligible queue: %w", err)
+	}
+	return queueID, true, nil
 }
 
 // MarkRunningFenced atomically transitions the job and its execution to running.

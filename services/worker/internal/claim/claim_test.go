@@ -107,7 +107,6 @@ func TestClaimExclusivity(t *testing.T) {
 		pool.Exec(context.Background(), `DELETE FROM workers WHERE id IN ($1, $2)`, worker1, worker2)
 	})
 
-
 	var mu sync.Mutex
 	claimedByW1 := map[uuid.UUID]bool{}
 	claimedByW2 := map[uuid.UUID]bool{}
@@ -155,8 +154,8 @@ func TestClaimExclusivity(t *testing.T) {
 	}
 }
 
-// TestStaleLeaseFencingRejectsComplete verifies that a stale worker cannot mark a job complete.
-func TestStaleLeaseFencingRejectsComplete(t *testing.T) {
+// TestChangedLeaseTokenRejectsTransitions verifies that a worker cannot use an old token.
+func TestChangedLeaseTokenRejectsTransitions(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 

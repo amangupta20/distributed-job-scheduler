@@ -3,7 +3,7 @@
 **A PostgreSQL-backed distributed job scheduler engineered for observable, failure-aware execution.**
 
 ![Status: work in progress](https://img.shields.io/badge/status-work_in_progress-orange)
-![Evidence: pending](https://img.shields.io/badge/evidence-pending-lightgrey)
+![Worker persistence: verified](https://img.shields.io/badge/worker_persistence-verified-brightgreen)
 
 > **Hero image capture pending.** A screenshot will be added only after the seeded application is running and the capture can be tied to a verified commit. No mock image is presented as implementation evidence.
 
@@ -13,28 +13,30 @@ PulseQueue is being built to demonstrate the hard parts of distributed job execu
 
 ## Quick start
 
-The repository workflow is scaffolded, but the Compose stack is not implemented yet. Once `deploy/compose.yaml` and the services land, the canonical local workflow will be:
+The repository includes container definitions for PostgreSQL, one-shot migrations, the API, scheduler, Go worker, Prometheus, and Grafana. Start the implemented backend services with:
 
 ```bash
 cp .env.example .env
 # Replace JWT_SECRET in .env before starting the stack.
-make up
-make seed
+docker compose -f deploy/compose.yaml up -d postgres
+until docker compose -f deploy/compose.yaml exec -T postgres pg_isready -U scheduler -d scheduler; do sleep 1; done
+docker compose -f deploy/compose.yaml run --rm migrate
+docker compose -f deploy/compose.yaml up -d --build api scheduler worker
 ```
 
-The planned API and dashboard ports default to `8000` and `3000`. Use `make down` to stop the stack.
+The API defaults to port `8000`. The dashboard is not implemented yet. Use `make down` to stop the stack.
 
 ## Container topology
 
-The planned Compose topology has `postgres`, `migrate`, `api`, `scheduler`, `worker`, and `dashboard` services. The target design keeps PostgreSQL, the scheduler, and scalable worker replicas on a private backend network; only the API and dashboard also join the edge network. The Compose definition and topology checks are work in progress.
+The Compose topology currently has `postgres`, `migrate`, `api`, `scheduler`, `worker`, `prometheus`, and `grafana` services. PostgreSQL, the scheduler, and workers use an internal backend network; the API also joins the public network. Worker replicas have no fixed `container_name`, so `docker compose -f deploy/compose.yaml up -d --scale worker=3` remains available. Health-gated dependency conditions and true observability profiles are still being hardened and are not claimed complete.
 
 ## Architecture
 
-PostgreSQL is intended to be the single durable queue and source of truth. FastAPI and a Python scheduler will form the control plane, while concurrent Go workers will claim and execute jobs. Notification-assisted polling is planned as a latency optimization, with polling retained for correctness. Architecture diagrams will be linked after they are implemented and validated.
+PostgreSQL is the single durable queue and source of truth. FastAPI provides the control plane, a Python scheduler materializes scheduled work and scans leases, and concurrent Go workers claim and execute jobs. Workers use notification-assisted polling as a latency optimization while retaining polling for correctness. Architecture diagrams remain to be added.
 
 ## Reliability model
 
-The delivery model is at-least-once execution. Worker claims use PostgreSQL `SKIP LOCKED`, database-clock schedule eligibility and leases, unique fencing tokens, strict queue concurrency limits, and transactionally shared rate tokens. Claiming also creates the execution attempt and state event in the same transaction. Completion and failure reject expired or stale leases; each terminal transaction persists the job state, execution outcome, structured logs, and state event together. Retryable failures use fixed, linear, or capped exponential policy delays, while permanent and exhausted failures enter the DLQ atomically. Exactly-once external side effects are explicitly not a project claim. Graceful worker drain and scheduler-driven recovery still require end-to-end evidence.
+The delivery model is at-least-once execution. Worker claims use PostgreSQL `SKIP LOCKED`, database-clock schedule eligibility and leases, unique fencing tokens, strict queue concurrency limits, and transactionally shared rate tokens. Queue selection locks only the selected contributing queue, so an unrelated queue remains claimable by another worker; contenders for the same queue serialize and share its capacity correctly. Claiming also creates the execution attempt and state event in the same transaction. Completion and failure reject expired or stale leases; each terminal transaction persists the job state, execution outcome, structured logs, and state event together. Retryable failures use fixed, linear, or capped exponential policy delays, while permanent and exhausted failures enter the DLQ atomically. Priority aging currently uses fixed worker defaults of a 60-second interval and a maximum boost of 100. Exactly-once external side effects are explicitly not a project claim. Graceful worker drain and scheduler-driven recovery still require end-to-end evidence.
 
 ## Visual feature tour
 
@@ -50,45 +52,38 @@ No throughput or latency figures are published yet. The planned benchmark will r
 
 ## API and data model
 
-The planned API covers authenticated organizations, projects, queues, jobs, workers, dead-letter replay, health, and operational metrics. The canonical OpenAPI document, database schema, and job-state contract will be linked here only after they exist.
+The FastAPI control plane implements authentication plus project, queue, retry-policy, job, worker, health, and dead-letter replay routes. SQLAlchemy models, an Alembic migration, and static contracts under `packages/contracts/` are present. Operational detail endpoints and contract-drift verification are still in progress.
 
 ## Development and tests
 
-The canonical commands are defined in the [Makefile](Makefile):
+The worker persistence suite runs inside a Go builder container attached only to the Compose backend network. This keeps PostgreSQL private instead of publishing a host database port:
 
 ```bash
-make test
-make integration-test
-make chaos-demo
-make benchmark
-make logs
-make observability
+docker compose -f deploy/compose.yaml up -d postgres
+until docker compose -f deploy/compose.yaml exec -T postgres pg_isready -U scheduler -d scheduler; do sleep 1; done
+docker compose -f deploy/compose.yaml run --rm migrate
+docker build --target builder -t pulsequeue-worker-test services/worker
+BACKEND_NETWORK=$(docker inspect "$(docker compose -f deploy/compose.yaml ps -q postgres)" \
+  --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{end}}')
+docker run --rm --network "$BACKEND_NETWORK" \
+  -e WORKER_DATABASE_URL=postgresql://scheduler:scheduler@postgres:5432/scheduler \
+  pulsequeue-worker-test go test -count=1 ./internal/claim -v
 ```
 
-The worker persistence integration suite requires a migrated PostgreSQL database and is run directly with:
-
-```bash
-cd services/worker
-WORKER_DATABASE_URL=postgresql://scheduler:scheduler@127.0.0.1:5432/scheduler \
-  go test -race ./internal/claim -v
-```
-
-These commands are stable workflow contracts. Their referenced services, tests, and scripts will be added in later milestones; this scaffold does not claim that application tests can run yet.
+The [Makefile](Makefile) also records intended integration, seed, chaos, and benchmark workflows. Several referenced test services/scripts are not wired yet, so those targets are roadmap interfaces rather than current evidence.
 
 ## Claim-to-evidence table
 
 | Claim | Status | Evidence |
 |---|---|---|
-| Project-local agent concurrency is bounded to four threads with no recursive fan-out. | Configured | [Agent configuration](.codex/config.toml) |
-| Implementation roles have exclusive path ownership and a read-only reviewer role exists. | Configured | [Agent definitions](.codex/agents/) |
-| Environment names and canonical workflow commands are established. | Configured | [.env.example](.env.example) and [Makefile](Makefile) |
 | Go workers claim exclusively while enforcing shared queue concurrency and rate budgets. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) |
+| A locked busy queue does not prevent another worker from claiming an independent queue. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) |
 | Lease-fenced completion, policy retries, permanent failure, and exhausted-attempt DLQ transitions are atomic. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) and [`retry_test.go`](services/worker/internal/claim/retry_test.go) |
 | Scheduler lease recovery, graceful drain, container health, UI behavior, and performance meet their design goals. | Not yet evidenced | Evidence will be added as the corresponding implementation milestones pass. |
 
 ## Trade-offs and limitations
 
-- The application, containers, tests, diagrams, benchmarks, and screenshots are not implemented at this scaffold milestone.
+- The API, scheduler, worker, database migration, containers, and service-level tests exist; the dashboard, deterministic demo seed, architecture diagrams, end-to-end chaos suite, benchmark harness, and screenshots remain incomplete.
 - PostgreSQL is the only planned durable queue; the design intentionally does not add Redis or Kafka.
 - At-least-once execution means handlers must tolerate retries and make external side effects idempotent where required.
 - Benchmark results will be local and environment-qualified, not universal capacity guarantees.
