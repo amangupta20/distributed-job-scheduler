@@ -1,0 +1,4 @@
+{
+  "job_states": ["queued", "scheduled", "claimed", "running", "retry_scheduled", "completed", "cancelled", "dead_lettered"],
+  "worker_states": ["starting", "ready", "draining", "offline"]
+}
