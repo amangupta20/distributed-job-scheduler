@@ -4,6 +4,7 @@ from fastapi import Depends, FastAPI, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import text
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from scheduler_api.db import get_session
 from scheduler_api.errors import install_error_handlers
@@ -50,4 +51,12 @@ def create_app() -> FastAPI:
         await session.execute(text("SELECT 1"))
         return {"status": "ready"}
 
+    @app.get("/metrics")
+    async def metrics() -> Response:
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
     return app
+
+
+# Module-level app instance for uvicorn
+app = create_app()
