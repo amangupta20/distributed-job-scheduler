@@ -9,7 +9,7 @@
 
 ## Why this stands out
 
-PulseQueue is being built to demonstrate the hard parts of distributed job execution rather than hide them: atomic claims, renewable leases, fencing, bounded concurrency, graceful drain, and recovery after worker loss. The Go worker has database-backed evidence for exclusive claims, strict per-queue concurrency, shared rate-token budgets, lease fencing, policy-driven retries, and atomic dead-letter transitions. Scheduler tests now prove deterministic cron materialization, due-job promotion, and single-attempt lease recovery under concurrent ticks. Graceful-drain evidence remains in progress.
+PulseQueue is being built to demonstrate the hard parts of distributed job execution rather than hide them: atomic claims, renewable leases, fencing, bounded concurrency, graceful drain, and recovery after worker loss. The Go worker has database-backed evidence for exclusive claims, strict per-queue concurrency, shared rate-token budgets, lease fencing, policy-driven retries, and atomic dead-letter transitions. Scheduler tests now prove deterministic cron materialization, due-job promotion, and single-attempt lease recovery under concurrent ticks. Worker unit tests verify that draining stops new claims without cancelling valid in-flight handler contexts, that a drain timeout cancels remaining executions, and that a lost lease cancels only its owning handler context.
 
 ## Quick start
 
@@ -81,7 +81,7 @@ The [Makefile](Makefile) also records intended integration, seed, chaos, and ben
 | Lease-fenced completion, policy retries, permanent failure, and exhausted-attempt DLQ transitions are atomic. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) and [`retry_test.go`](services/worker/internal/claim/retry_test.go) |
 | Scheduler cron materialization, due-job promotion, lease-attempt accounting, stale-token invalidation, and concurrent recovery idempotency. | Verified | [`services/scheduler/tests/test_tick.py`](services/scheduler/tests/test_tick.py) |
 | Recurring schedules are tenant-scoped, validate cron and queue ownership, and support create/list/delete. | Verified | [`services/api/tests/test_scheduled_jobs.py`](services/api/tests/test_scheduled_jobs.py) — 3 focused tests; full API suite passes. |
-| Graceful drain, container health, UI behavior, and performance meet their design goals. | Not yet evidenced | Evidence will be added as the corresponding implementation milestones pass. |
+| Graceful drain, container health, UI behavior, and performance meet their design goals. | Partially verified | [`services/worker/internal/worker/coordinator_test.go`](services/worker/internal/worker/coordinator_test.go) covers worker drain and lease-loss context ownership; container health, UI, and performance evidence remain pending. |
 
 ## Trade-offs and limitations
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +27,10 @@ type Worker struct {
 
 	activeJobs sync.WaitGroup
 	sem        chan struct{} // bounded goroutine pool
+
+	draining atomic.Bool
+	jobsMu   sync.Mutex
+	cancels  map[uuid.UUID]context.CancelFunc
 }
 
 // New creates a new Worker.
@@ -37,11 +42,22 @@ func New(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger) *Worker {
 		handlers: handler.New(),
 		log:      log,
 		sem:      make(chan struct{}, cfg.Concurrency),
+		cancels:  make(map[uuid.UUID]context.CancelFunc),
 	}
 }
 
 // ID returns the worker's UUID.
 func (w *Worker) ID() uuid.UUID { return w.id }
+
+// BeginDrain prevents new claims while allowing in-flight executions to finish.
+func (w *Worker) BeginDrain() {
+	w.draining.Store(true)
+}
+
+// AcceptingClaims reports whether this worker may claim more work.
+func (w *Worker) AcceptingClaims() bool {
+	return !w.draining.Load()
+}
 
 // Register registers this worker with the control plane API.
 func (w *Worker) Register(ctx context.Context) error {
@@ -63,9 +79,18 @@ func (w *Worker) Deregister(ctx context.Context) error {
 	return err
 }
 
+// MarkOffline records that this process has finished its drain procedure.
+func (w *Worker) MarkOffline(ctx context.Context) error {
+	_, err := w.pool.Exec(ctx, `
+		UPDATE workers SET status = 'offline', updated_at = now() WHERE id = $1
+	`, w.id)
+	return err
+}
+
 // Run is the main worker loop. It claims jobs, dispatches them to the goroutine pool,
 // sends heartbeats, and extends leases. It returns when ctx is cancelled.
 func (w *Worker) Run(ctx context.Context) {
+	defer w.BeginDrain()
 	pollTicker := time.NewTicker(w.cfg.PollInterval())
 	heartbeatTicker := time.NewTicker(w.cfg.HeartbeatInterval())
 	defer pollTicker.Stop()
@@ -101,6 +126,7 @@ func (w *Worker) Drain(timeout time.Duration) {
 		w.log.Info("graceful drain complete")
 	case <-time.After(timeout):
 		w.log.Warn("drain timeout exceeded, some jobs may not have completed")
+		w.cancelAllExecutions()
 	}
 }
 
@@ -137,6 +163,9 @@ func (w *Worker) listenNotify(ctx context.Context, notifyCh chan<- struct{}) {
 
 // claimAndDispatch claims a batch of jobs and dispatches each to the goroutine pool.
 func (w *Worker) claimAndDispatch(ctx context.Context) {
+	if !w.AcceptingClaims() {
+		return
+	}
 	// Only claim up to available goroutine slots
 	available := cap(w.sem) - len(w.sem)
 	if available <= 0 {
@@ -167,17 +196,25 @@ func (w *Worker) claimAndDispatch(ctx context.Context) {
 				<-w.sem // release slot
 				w.activeJobs.Done()
 			}()
-			w.executeJob(ctx, j)
+			w.executeJob(j)
 		}(j)
 	}
 }
 
 // executeJob runs a single job to completion, handling lease extension and result reporting.
-func (w *Worker) executeJob(ctx context.Context, j claim.Job) {
+func (w *Worker) executeJob(j claim.Job) {
 	log := w.log.With("job_id", j.ID, "type", j.Type, "attempt", j.AttemptCount+1)
 	log.Info("executing job")
 
-	if ok, err := claim.MarkRunningFenced(ctx, w.pool, j); err != nil {
+	// Build job execution context with timeout
+	timeout := time.Duration(j.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	jobCtx, release := w.newExecutionContext(j.ID, timeout)
+	defer release()
+
+	if ok, err := claim.MarkRunningFenced(jobCtx, w.pool, j); err != nil {
 		log.Warn("mark running failed", "err", err)
 		return
 	} else if !ok {
@@ -185,17 +222,9 @@ func (w *Worker) executeJob(ctx context.Context, j claim.Job) {
 		return
 	}
 
-	// Build job execution context with timeout
-	timeout := time.Duration(j.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 5 * time.Minute
-	}
-	jobCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
 	// Start lease extension in background
 	stopExtend := make(chan struct{})
-	go w.extendLeaseLoop(ctx, j, stopExtend)
+	go w.extendLeaseLoop(jobCtx, j, stopExtend, func() { w.cancelExecution(j.ID) })
 	defer close(stopExtend)
 
 	startTime := time.Now()
@@ -217,14 +246,14 @@ func (w *Worker) executeJob(ctx context.Context, j claim.Job) {
 	// Finalize
 	if result.Success {
 		log.Info("job completed", "elapsed_ms", elapsed.Milliseconds())
-		if ok, err := claim.CompleteResult(ctx, w.pool, j, persisted); err != nil {
+		if ok, err := claim.CompleteResult(jobCtx, w.pool, j, persisted); err != nil {
 			log.Error("complete job", "err", err)
 		} else if !ok {
 			log.Warn("complete job rejected stale or expired lease")
 		}
 	} else {
 		log.Warn("job failed", "elapsed_ms", elapsed.Milliseconds(), "error", result.Error, "retryable", result.Retryable)
-		if ok, err := claim.FailResult(ctx, w.pool, j, persisted); err != nil {
+		if ok, err := claim.FailResult(jobCtx, w.pool, j, persisted); err != nil {
 			log.Error("fail job", "err", err)
 		} else if !ok {
 			log.Warn("fail job rejected stale or expired lease")
@@ -243,7 +272,7 @@ func persistenceResult(result handler.Result) claim.ExecutionResult {
 }
 
 // extendLeaseLoop periodically extends the job's lease until stopped.
-func (w *Worker) extendLeaseLoop(ctx context.Context, j claim.Job, stop <-chan struct{}) {
+func (w *Worker) extendLeaseLoop(ctx context.Context, j claim.Job, stop <-chan struct{}, cancelExecution func()) {
 	interval := w.cfg.LeaseDuration() / 2
 	if interval < time.Second {
 		interval = time.Second
@@ -261,9 +290,48 @@ func (w *Worker) extendLeaseLoop(ctx context.Context, j claim.Job, stop <-chan s
 				w.log.Warn("extend lease", "job_id", j.ID, "err", err)
 			} else if !ok {
 				w.log.Warn("extend lease rejected stale or expired lease", "job_id", j.ID)
+				cancelExecution()
 				return
 			}
 		}
+	}
+}
+
+// newExecutionContext deliberately detaches handler lifetime from the claim-loop
+// context. Shutdown stops claims, while a drain timeout or lost lease cancels only
+// the affected active execution.
+func (w *Worker) newExecutionContext(jobID uuid.UUID, timeout time.Duration) (context.Context, func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	w.jobsMu.Lock()
+	w.cancels[jobID] = cancel
+	w.jobsMu.Unlock()
+	return ctx, func() {
+		cancel()
+		w.jobsMu.Lock()
+		delete(w.cancels, jobID)
+		w.jobsMu.Unlock()
+	}
+}
+
+func (w *Worker) cancelExecution(jobID uuid.UUID) bool {
+	w.jobsMu.Lock()
+	cancel, ok := w.cancels[jobID]
+	w.jobsMu.Unlock()
+	if ok {
+		cancel()
+	}
+	return ok
+}
+
+func (w *Worker) cancelAllExecutions() {
+	w.jobsMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(w.cancels))
+	for _, cancel := range w.cancels {
+		cancels = append(cancels, cancel)
+	}
+	w.jobsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
 	}
 }
 

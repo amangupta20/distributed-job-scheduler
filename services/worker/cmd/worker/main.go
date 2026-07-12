@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/pulsequeue/worker/internal/config"
 	"github.com/pulsequeue/worker/internal/worker"
@@ -25,8 +26,8 @@ func main() {
 		"concurrency", cfg.Concurrency,
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
 
 	// Connect to database with retry
 	pool, err := worker.WaitForDB(ctx, cfg.DatabaseURL, log)
@@ -45,28 +46,31 @@ func main() {
 	}
 	log.Info("worker registered", "id", w.ID())
 
-	// Set up signal handling for graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-
 	// Run the worker loop in background
 	go func() {
 		w.Run(ctx)
 	}()
 
-	// Wait for shutdown signal
-	sig := <-sigCh
-	log.Info("received shutdown signal, draining...", "signal", sig)
-	cancel()
+	// The signal context stops the claim loop. Execution contexts are separate and
+	// remain valid until completion or the configured drain timeout.
+	<-ctx.Done()
+	log.Info("received shutdown signal, draining...")
+	w.BeginDrain()
 
 	// Mark worker as draining
-	drainCtx := context.Background()
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := w.Deregister(drainCtx); err != nil {
 		log.Warn("deregister worker", "err", err)
 	}
+	cancelDrain()
 
 	// Wait for active jobs to finish (up to drain timeout)
 	w.Drain(cfg.DrainTimeout())
+	offlineCtx, cancelOffline := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := w.MarkOffline(offlineCtx); err != nil {
+		log.Warn("mark worker offline", "err", err)
+	}
+	cancelOffline()
 
 	log.Info("worker shutdown complete")
 }
