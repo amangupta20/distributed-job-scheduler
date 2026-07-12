@@ -61,7 +61,9 @@ async def materialize_cron(session_factory: async_sessionmaker, now: datetime, b
                     break
 
             for occ in occurrences:
-                idem_key = f"cron:{sj.id}:{occ.isoformat()}"
+                # The scheduled definition and UTC occurrence uniquely identify
+                # a materialized run across concurrent scheduler ticks.
+                idem_key = f"{sj.id}:{occ.isoformat()}"
 
                 # Check if job already exists (idempotency safety)
                 exist_check = await session.execute(
@@ -177,6 +179,9 @@ async def recover_expired_leases(session_factory: async_sessionmaker, now: datet
 
         for job in jobs:
             old_status = job.status
+            # A lease represents an in-flight attempt. Losing it consumes that
+            # attempt before deciding whether the job may be retried.
+            job.attempt_count += 1
 
             if job.attempt_count < job.max_attempts:
                 # Resolve policy

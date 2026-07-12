@@ -9,7 +9,7 @@
 
 ## Why this stands out
 
-PulseQueue is being built to demonstrate the hard parts of distributed job execution rather than hide them: atomic claims, renewable leases, fencing, bounded concurrency, graceful drain, and recovery after worker loss. The Go worker now has database-backed evidence for exclusive claims, strict per-queue concurrency, shared rate-token budgets, lease fencing, policy-driven retries, and atomic dead-letter transitions. Graceful-drain and worker-loss recovery evidence remain in progress.
+PulseQueue is being built to demonstrate the hard parts of distributed job execution rather than hide them: atomic claims, renewable leases, fencing, bounded concurrency, graceful drain, and recovery after worker loss. The Go worker has database-backed evidence for exclusive claims, strict per-queue concurrency, shared rate-token budgets, lease fencing, policy-driven retries, and atomic dead-letter transitions. Scheduler tests now prove deterministic cron materialization, due-job promotion, and single-attempt lease recovery under concurrent ticks. Graceful-drain evidence remains in progress.
 
 ## Quick start
 
@@ -36,7 +36,7 @@ PostgreSQL is the single durable queue and source of truth. FastAPI provides the
 
 ## Reliability model
 
-The delivery model is at-least-once execution. Worker claims use PostgreSQL `SKIP LOCKED`, database-clock schedule eligibility and leases, unique fencing tokens, strict queue concurrency limits, and transactionally shared rate tokens. Queue selection locks only the selected contributing queue, so an unrelated queue remains claimable by another worker; contenders for the same queue serialize and share its capacity correctly. Claiming also creates the execution attempt and state event in the same transaction. Completion and failure reject expired or stale leases; each terminal transaction persists the job state, execution outcome, structured logs, and state event together. Retryable failures use fixed, linear, or capped exponential policy delays, while permanent and exhausted failures enter the DLQ atomically. Priority aging currently uses fixed worker defaults of a 60-second interval and a maximum boost of 100. Exactly-once external side effects are explicitly not a project claim. Graceful worker drain and scheduler-driven recovery still require end-to-end evidence.
+The delivery model is at-least-once execution. Worker claims use PostgreSQL `SKIP LOCKED`, database-clock schedule eligibility and leases, unique fencing tokens, strict queue concurrency limits, and transactionally shared rate tokens. Queue selection locks only the selected contributing queue, so an unrelated queue remains claimable by another worker; contenders for the same queue serialize and share its capacity correctly. Claiming also creates the execution attempt and state event in the same transaction. Completion and failure reject expired or stale leases; each terminal transaction persists the job state, execution outcome, structured logs, and state event together. Retryable failures use fixed, linear, or capped exponential policy delays, while permanent and exhausted failures enter the DLQ atomically. Scheduler recovery consumes the lost in-flight attempt, atomically clears worker ownership and lease state, then either schedules policy-driven retry or creates one DLQ entry; concurrent scheduler ticks use row locking to prevent duplicate recovery events. Priority aging currently uses fixed worker defaults of a 60-second interval and a maximum boost of 100. Exactly-once external side effects are explicitly not a project claim. Graceful worker drain still requires end-to-end evidence.
 
 ## Visual feature tour
 
@@ -79,7 +79,8 @@ The [Makefile](Makefile) also records intended integration, seed, chaos, and ben
 | Go workers claim exclusively while enforcing shared queue concurrency and rate budgets. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) |
 | A locked busy queue does not prevent another worker from claiming an independent queue. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) |
 | Lease-fenced completion, policy retries, permanent failure, and exhausted-attempt DLQ transitions are atomic. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) and [`retry_test.go`](services/worker/internal/claim/retry_test.go) |
-| Scheduler lease recovery, graceful drain, container health, UI behavior, and performance meet their design goals. | Not yet evidenced | Evidence will be added as the corresponding implementation milestones pass. |
+| Scheduler cron materialization, due-job promotion, lease-attempt accounting, stale-token invalidation, and concurrent recovery idempotency. | Verified | [`services/scheduler/tests/test_tick.py`](services/scheduler/tests/test_tick.py) |
+| Graceful drain, container health, UI behavior, and performance meet their design goals. | Not yet evidenced | Evidence will be added as the corresponding implementation milestones pass. |
 
 ## Trade-offs and limitations
 
