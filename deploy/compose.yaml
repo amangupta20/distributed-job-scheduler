@@ -103,6 +103,29 @@ services:
       retries: 6
     restart: unless-stopped
 
+  # ── Go Worker (scalable: docker-compose up --scale worker=3) ─────────────────
+  worker:
+    build:
+      context: ../services/worker
+      dockerfile: Dockerfile
+    environment:
+      WORKER_DATABASE_URL: ${WORKER_DATABASE_URL}
+      WORKER_NAME: pulsequeue-worker
+      WORKER_VERSION: "0.1.0"
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY}
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE}
+      WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS}
+      WORKER_HEARTBEAT_SECONDS: ${WORKER_HEARTBEAT_SECONDS}
+      WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS}
+      WORKER_DRAIN_SECONDS: ${WORKER_DRAIN_SECONDS}
+    networks:
+      - backend
+    depends_on:
+      - migrate
+      - postgres
+    restart: unless-stopped
+    stop_grace_period: 30s
+
   # ── Prometheus (optional — start with: docker-compose --profile observability up) ─
   prometheus:
     image: prom/prometheus:v2.52.0
