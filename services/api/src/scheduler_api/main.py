@@ -29,11 +29,14 @@ def create_app() -> FastAPI:
     from scheduler_api.routes.projects import router as projects_router
     from scheduler_api.routes.retry_policies import router as retry_policies_router
     from scheduler_api.routes.queues import router as queues_router
+    from scheduler_api.routes.jobs import router as jobs_router
 
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(projects_router, prefix="/api/v1")
     app.include_router(retry_policies_router, prefix="/api/v1")
     app.include_router(queues_router, prefix="/api/v1")
+    app.include_router(jobs_router, prefix="/api/v1")
+
 
 
     @app.get("/health/live")

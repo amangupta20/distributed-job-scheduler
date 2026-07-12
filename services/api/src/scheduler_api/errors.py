@@ -19,18 +19,23 @@ def get_trace_id(request: Request) -> str:
     return getattr(request.state, "trace_id", str(uuid.uuid4()))
 
 
+from fastapi.encoders import jsonable_encoder
+
+
 def make_error_response(code: str, message: str, status_code: int, trace_id: str, details: Optional[Dict[str, Any]] = None) -> JSONResponse:
+    content = {
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details,
+            "trace_id": trace_id,
+        }
+    }
     return JSONResponse(
         status_code=status_code,
-        content={
-            "error": {
-                "code": code,
-                "message": message,
-                "details": details,
-                "trace_id": trace_id,
-            }
-        },
+        content=jsonable_encoder(content),
     )
+
 
 
 async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
