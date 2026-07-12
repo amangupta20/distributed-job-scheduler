@@ -52,7 +52,7 @@ No throughput or latency figures are published yet. The planned benchmark will r
 
 ## API and data model
 
-The FastAPI control plane implements authentication plus project, queue, retry-policy, job, worker, health, and dead-letter replay routes. SQLAlchemy models, an Alembic migration, and static contracts under `packages/contracts/` are present. Operational detail endpoints and contract-drift verification are still in progress.
+The FastAPI control plane implements authentication plus project, queue, retry-policy, job, recurring scheduled-job, worker, health, and dead-letter replay routes. Recurring schedules support tenant-scoped create, project-scoped list, and deletion; cron expressions and queue/project ownership are validated before persistence. SQLAlchemy models, an Alembic migration, and static contracts under `packages/contracts/` are present. Operational detail endpoints and contract-drift verification are still in progress.
 
 ## Development and tests
 
@@ -80,6 +80,7 @@ The [Makefile](Makefile) also records intended integration, seed, chaos, and ben
 | A locked busy queue does not prevent another worker from claiming an independent queue. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) |
 | Lease-fenced completion, policy retries, permanent failure, and exhausted-attempt DLQ transitions are atomic. | Verified | [`services/worker/internal/claim/persistence_test.go`](services/worker/internal/claim/persistence_test.go) and [`retry_test.go`](services/worker/internal/claim/retry_test.go) |
 | Scheduler cron materialization, due-job promotion, lease-attempt accounting, stale-token invalidation, and concurrent recovery idempotency. | Verified | [`services/scheduler/tests/test_tick.py`](services/scheduler/tests/test_tick.py) |
+| Recurring schedules are tenant-scoped, validate cron and queue ownership, and support create/list/delete. | Verified | [`services/api/tests/test_scheduled_jobs.py`](services/api/tests/test_scheduled_jobs.py) — 3 focused tests; full API suite passes. |
 | Graceful drain, container health, UI behavior, and performance meet their design goals. | Not yet evidenced | Evidence will be added as the corresponding implementation milestones pass. |
 
 ## Trade-offs and limitations

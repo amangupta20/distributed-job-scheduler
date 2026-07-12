@@ -31,6 +31,7 @@ def create_app() -> FastAPI:
     from scheduler_api.routes.retry_policies import router as retry_policies_router
     from scheduler_api.routes.queues import router as queues_router
     from scheduler_api.routes.jobs import router as jobs_router
+    from scheduler_api.routes.scheduled_jobs import router as scheduled_jobs_router
     from scheduler_api.routes.workers import router as workers_router
 
     app.include_router(auth_router, prefix="/api/v1")
@@ -38,6 +39,7 @@ def create_app() -> FastAPI:
     app.include_router(retry_policies_router, prefix="/api/v1")
     app.include_router(queues_router, prefix="/api/v1")
     app.include_router(jobs_router, prefix="/api/v1")
+    app.include_router(scheduled_jobs_router, prefix="/api/v1")
     app.include_router(workers_router, prefix="/api/v1")
 
 
