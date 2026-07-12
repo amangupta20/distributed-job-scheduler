@@ -351,6 +351,42 @@ The repository includes:
 - Reproducible benchmarks and critical `EXPLAIN ANALYZE` plans.
 - A README claim-to-evidence table linking each claim to code or tests.
 
+### 16.1 README as a Product Surface
+
+The root README is a primary evaluation artifact and must remain polished, visual, and current throughout implementation. Every milestone that changes setup, behavior, architecture, commands, APIs, metrics, or UI must update the README in the same commit or a directly associated documentation commit.
+
+The README will include:
+
+- A strong project name, concise engineering tagline, and status badges.
+- A hero screenshot of the populated operations dashboard.
+- A one-command quick start near the top of the document.
+- A short differentiators section focused on container behavior, reliability, observability, and measured performance.
+- Mermaid architecture, job-lifecycle, and deployment-topology diagrams.
+- A visual feature tour with real dashboard screenshots.
+- A documented worker-scaling and chaos-recovery walkthrough.
+- A benchmark table with environment and workload disclosure.
+- The claim-to-evidence table linking claims to code, tests, query plans, or benchmark artifacts.
+- Links to OpenAPI, ER design, architecture decisions, testing instructions, and the optional Grafana profile.
+- A clear limitations and trade-offs section to keep the presentation credible.
+
+Visual assets use stable paths under `docs/assets/` and descriptive filenames. The intended capture set is:
+
+```text
+docs/assets/dashboard-overview.png
+docs/assets/queue-health.png
+docs/assets/job-execution-timeline.png
+docs/assets/worker-scaling.png
+docs/assets/dead-letter-replay.png
+docs/assets/grafana-operations.png
+docs/assets/chaos-recovery.gif
+```
+
+Screenshots must come from the working application populated by a deterministic demo seed. Generated or mocked UI images must not be presented as implementation evidence. If the remote environment cannot capture a required image, the repository will include exact startup, seed, route, viewport, and capture instructions so the user can run the system locally and supply the asset without guesswork.
+
+The optional animated chaos-recovery asset should show a worker being terminated, the lease expiring, another worker reclaiming the job, and the dashboard returning to a healthy state. Static images are acceptable when animated capture is unavailable.
+
+README maintenance is part of the definition of done for every implementation task. Before each milestone commit, the root agent checks whether the task changed any documented command, configuration value, feature claim, screenshot, diagram, or limitation and updates the README accordingly.
+
 ## 17. Agent Orchestration
 
 The root agent owns architecture, cross-service contracts, integration, repository-wide commits, and final verification. Three file-isolated implementation agents may work concurrently:
