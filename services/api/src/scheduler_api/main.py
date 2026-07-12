@@ -24,6 +24,18 @@ def create_app() -> FastAPI:
     app.add_middleware(TraceIdMiddleware)
     install_error_handlers(app)
 
+    # Register routers
+    from scheduler_api.routes.auth import router as auth_router
+    from scheduler_api.routes.projects import router as projects_router
+    from scheduler_api.routes.retry_policies import router as retry_policies_router
+    from scheduler_api.routes.queues import router as queues_router
+
+    app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(projects_router, prefix="/api/v1")
+    app.include_router(retry_policies_router, prefix="/api/v1")
+    app.include_router(queues_router, prefix="/api/v1")
+
+
     @app.get("/health/live")
     async def live() -> Dict[str, str]:
         return {"status": "alive"}

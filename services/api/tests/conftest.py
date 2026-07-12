@@ -1,5 +1,6 @@
 import pytest
 from typing import AsyncGenerator
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from scheduler_api.config import settings
@@ -36,3 +37,19 @@ async def db_session(db_engine) -> AsyncGenerator[AsyncSession, None]:
     async with async_session() as session:
         yield session
         await session.rollback()
+
+
+@pytest.fixture
+async def api_client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+    from httpx import AsyncClient, ASGITransport
+    from scheduler_api.main import create_app
+    from scheduler_api.db import get_session
+
+    app = create_app()
+    app.dependency_overrides[get_session] = lambda: db_session
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        yield client
+
+    app.dependency_overrides.clear()
+
