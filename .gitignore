@@ -1,2 +1,53 @@
 .worktrees/
 .superpowers/
+
+# Local environment and secrets (keep the safe template committed)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Python caches, environments, and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.venv/
+venv/
+.coverage
+.coverage.*
+htmlcov/
+
+# Node dependencies, framework output, and test output
+node_modules/
+.next/
+coverage/
+playwright-report/
+test-results/
+
+# Compiled binaries and build output
+bin/
+build/
+dist/
+*.exe
+*.out
+*.test
+
+# Generic test artifacts
+junit*.xml
+*.log
+
+# Local benchmark scratch data (committed reports remain under docs/benchmarks/)
+.benchmark/
+tests/benchmark/.scratch/
+docs/benchmarks/.scratch/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
