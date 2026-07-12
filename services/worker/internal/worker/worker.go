@@ -36,11 +36,15 @@ type Worker struct {
 	jobsMu      sync.Mutex
 	cancels     map[uuid.UUID]context.CancelFunc
 
-	claimBatch     func(context.Context, *pgxpool.Pool, uuid.UUID, int, time.Duration) ([]claim.Job, error)
-	runExecution   func(context.Context, claim.Job)
-	extendLease    func(context.Context, *pgxpool.Pool, claim.Job, time.Duration) (bool, error)
-	leaseInterval  func() time.Duration
-	beforeDispatch func()
+	claimBatch               func(context.Context, *pgxpool.Pool, uuid.UUID, int, time.Duration) ([]claim.Job, error)
+	runExecution             func(context.Context, claim.Job)
+	markRunning              func(context.Context, *pgxpool.Pool, claim.Job) (bool, error)
+	completeResult           func(context.Context, *pgxpool.Pool, claim.Job, claim.ExecutionResult) (bool, error)
+	failResult               func(context.Context, *pgxpool.Pool, claim.Job, claim.ExecutionResult) (bool, error)
+	extendLease              func(context.Context, *pgxpool.Pool, claim.Job, time.Duration) (bool, error)
+	leaseInterval            func() time.Duration
+	beforeDispatch           func()
+	beforeDrainAdmissionLock func()
 }
 
 // New creates a new Worker.
@@ -56,6 +60,9 @@ func New(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger) *Worker {
 	}
 	w.claimBatch = claim.ClaimBatch
 	w.runExecution = w.executeJob
+	w.markRunning = claim.MarkRunningFenced
+	w.completeResult = claim.CompleteResult
+	w.failResult = claim.FailResult
 	w.extendLease = claim.ExtendLeaseFenced
 	w.leaseInterval = func() time.Duration {
 		interval := w.cfg.LeaseDuration() / 2
@@ -72,6 +79,9 @@ func (w *Worker) ID() uuid.UUID { return w.id }
 
 // BeginDrain prevents new claims while allowing in-flight executions to finish.
 func (w *Worker) BeginDrain() {
+	if w.beforeDrainAdmissionLock != nil {
+		w.beforeDrainAdmissionLock()
+	}
 	w.admissionMu.Lock()
 	defer w.admissionMu.Unlock()
 	w.draining.Store(true)
@@ -262,7 +272,7 @@ func (w *Worker) executeJob(jobCtx context.Context, j claim.Job) {
 	log := w.log.With("job_id", j.ID, "type", j.Type, "attempt", j.AttemptCount+1)
 	log.Info("executing job")
 
-	if ok, err := claim.MarkRunningFenced(jobCtx, w.pool, j); err != nil {
+	if ok, err := w.markRunning(jobCtx, w.pool, j); err != nil {
 		log.Warn("mark running failed", "err", err)
 		return
 	} else if !ok {
@@ -296,14 +306,14 @@ func (w *Worker) executeJob(jobCtx context.Context, j claim.Job) {
 	// Finalize
 	if result.Success {
 		log.Info("job completed", "elapsed_ms", elapsed.Milliseconds())
-		if ok, err := claim.CompleteResult(finalizeCtx, w.pool, j, persisted); err != nil {
+		if ok, err := w.completeResult(finalizeCtx, w.pool, j, persisted); err != nil {
 			log.Error("complete job", "err", err)
 		} else if !ok {
 			log.Warn("complete job rejected stale or expired lease")
 		}
 	} else {
 		log.Warn("job failed", "elapsed_ms", elapsed.Milliseconds(), "error", result.Error, "retryable", result.Retryable)
-		if ok, err := claim.FailResult(finalizeCtx, w.pool, j, persisted); err != nil {
+		if ok, err := w.failResult(finalizeCtx, w.pool, j, persisted); err != nil {
 			log.Error("fail job", "err", err)
 		} else if !ok {
 			log.Warn("fail job rejected stale or expired lease")

@@ -44,11 +44,14 @@ func TestBeginDrainWaitsForClaimAdmissionBeforeDispatch(t *testing.T) {
 	}()
 	<-enteredDispatch
 
+	drainAttempted := make(chan struct{})
+	w.beforeDrainAdmissionLock = func() { close(drainAttempted) }
 	drainStarted := make(chan struct{})
 	go func() {
 		w.BeginDrain()
 		close(drainStarted)
 	}()
+	<-drainAttempted
 	select {
 	case <-drainStarted:
 		t.Fatal("drain completed while a claimed job had not been admitted")
@@ -59,6 +62,24 @@ func TestBeginDrainWaitsForClaimAdmissionBeforeDispatch(t *testing.T) {
 	<-claimed
 	<-drainStarted
 	w.Drain(time.Second)
+}
+
+func TestClaimAndDispatchDoesNotClaimAfterDrainCompletes(t *testing.T) {
+	w := newDrainTestWorker()
+	claimCalls := 0
+	w.claimBatch = func(context.Context, *pgxpool.Pool, uuid.UUID, int, time.Duration) ([]claim.Job, error) {
+		claimCalls++
+		return []claim.Job{testJob()}, nil
+	}
+	w.runExecution = func(context.Context, claim.Job) {
+		t.Fatal("dispatched work after drain completed")
+	}
+
+	w.BeginDrain()
+	w.claimAndDispatch(context.Background())
+	if claimCalls != 0 {
+		t.Fatalf("claim batch invoked %d times after drain", claimCalls)
+	}
 }
 
 func TestClaimLoopCancellationDoesNotCancelAdmittedExecution(t *testing.T) {
@@ -141,16 +162,33 @@ func TestLeaseExtensionLossCancelsOnlyOwningExecution(t *testing.T) {
 	}
 }
 
-func TestFinalizationContextSurvivesExecutionCancellation(t *testing.T) {
+func TestCancelledHandlerUsesLiveContextForTerminalPersistence(t *testing.T) {
 	w := newDrainTestWorker()
+	markedRunning := make(chan struct{})
+	w.markRunning = func(context.Context, *pgxpool.Pool, claim.Job) (bool, error) {
+		close(markedRunning)
+		return true, nil
+	}
+	finalized := make(chan struct{}, 1)
+	w.failResult = func(ctx context.Context, _ *pgxpool.Pool, _ claim.Job, _ claim.ExecutionResult) (bool, error) {
+		if ctx.Err() != nil {
+			t.Error("terminal persistence received a cancelled handler context")
+		}
+		finalized <- struct{}{}
+		return true, nil
+	}
 	jobCtx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		w.executeJob(jobCtx, claim.Job{
+			ID: uuid.New(), Type: "chaos", TimeoutSeconds: 60,
+			Payload: []byte(`{"mode":"timeout"}`),
+		})
+	}()
+	<-markedRunning
 	cancel()
-	if jobCtx.Err() == nil {
-		t.Fatal("test execution context was not cancelled")
-	}
-	finalizeCtx, release := w.finalizationContext()
-	defer release()
-	if finalizeCtx.Err() != nil {
-		t.Fatal("finalization context inherited execution cancellation")
-	}
+
+	<-finalized
+	<-finished
 }
