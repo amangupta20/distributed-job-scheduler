@@ -85,6 +85,21 @@ async def test_scheduled_job_rejects_invalid_cron_expression(
 
 
 @pytest.mark.asyncio
+async def test_scheduled_job_duplicate_name_returns_conflict_envelope(
+    api_client: AsyncClient, scheduled_job_environment
+) -> None:
+    project, queue, _, _, headers = scheduled_job_environment
+    payload = scheduled_job_payload(project.id, queue.id)
+
+    first = await api_client.post("/api/v1/scheduled-jobs", json=payload, headers=headers)
+    assert first.status_code == 201
+
+    duplicate = await api_client.post("/api/v1/scheduled-jobs", json=payload, headers=headers)
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "conflict"
+
+
+@pytest.mark.asyncio
 async def test_scheduled_job_rejects_cross_project_queue_and_cross_tenant_access(
     api_client: AsyncClient, db_session: AsyncSession, scheduled_job_environment
 ) -> None:
